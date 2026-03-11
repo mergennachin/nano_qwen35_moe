@@ -17,7 +17,7 @@ import torch
 from model import Qwen35MoE
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
-CKPT_PATH = os.path.join(_DIR, 'out-qwen35moe/ckpt.pt')
+CKPT_PATH = os.path.join(_DIR, 'checkpoint/ckpt.pt')
 DATA_DIR = os.path.join(_DIR, 'data_shakespeare_char')
 
 

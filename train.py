@@ -20,7 +20,7 @@ from model import Qwen35MoE, Qwen35MoEConfig
 
 # -----------------------------------------------------------------------------
 # config
-out_dir = 'out-qwen35moe'
+out_dir = 'checkpoint'
 eval_interval = 50
 log_interval = 10
 eval_iters = 10
