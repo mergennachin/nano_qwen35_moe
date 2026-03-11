@@ -1,6 +1,6 @@
 # nanoQwen3.5MoE
 
-A minimal, educational implementation of the Qwen3.5 MoE (Mixture of Experts) architecture in pure PyTorch. Single-file model definition (~300 lines), trainable on CPU.
+A minimal, educational implementation of the Qwen3.5 MoE (Mixture of Experts) architecture in pure PyTorch. Single-file model definition (~300 lines), trainable on CPU. This is inspired by and retrofitted based on [nanoGPT](https://github.com/karpathy/nanoGPT).
 
 ## Files
 
