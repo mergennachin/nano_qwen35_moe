@@ -72,8 +72,11 @@ L L L F L L L F    (L = GatedDeltaNet, F = Full Attention)
 | `forward(tokens, input_pos)` signature | Matches ExecuTorch's LLM convention |
 
 ```bash
-# Export to .pte
+# Export to .pte (portable)
 python export.py
+
+# Export with XNNPACK backend
+python export.py --backend xnnpack
 
 # Verify all modes produce identical output
 python verify_export.py

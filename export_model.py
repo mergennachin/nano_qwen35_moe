@@ -84,7 +84,6 @@ class ExportCausalSelfAttention(nn.Module):
             k = k.repeat_interleave(self.n_kv_groups, dim=1)
             v = v.repeat_interleave(self.n_kv_groups, dim=1)
 
-        # use pre-registered causal mask
         attn_mask = self.mask[input_pos]
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
 
@@ -97,8 +96,9 @@ class ExportCausalSelfAttention(nn.Module):
 
 class ExportGatedDeltaNet(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, use_scan=True):
         super().__init__()
+        self.use_scan = use_scan
         self.n_k_heads = config.linear_num_key_heads
         self.n_v_heads = config.linear_num_value_heads
         self.head_k_dim = config.linear_key_head_dim
@@ -161,33 +161,40 @@ class ExportGatedDeltaNet(nn.Module):
         k = F.normalize(k.view(B, T, self.n_k_heads, self.head_k_dim), p=2, dim=-1)
         v = v.view(B, T, self.n_v_heads, self.head_v_dim)
 
-        # delta rule recurrence via torch.scan (supports dynamic T)
-        # scan iterates over dim 0 of xs, carrying state forward
-        from torch._higher_order_ops.scan import scan
+        # delta rule recurrence
+        # use_scan=True: torch.scan (supports dynamic T, but not all backends)
+        # use_scan=False: for loop (unrolled at trace time, requires static T)
+        state = self.recurrent_state[:B].clone()
 
-        init_state = self.recurrent_state[:B].clone()  # (B, H, Dk, Dv)
+        if self.use_scan:
+            from torch._higher_order_ops.scan import scan
 
-        # Pack per-timestep inputs: (T, B, ...) for scan
-        q_t = q.transpose(0, 1).contiguous()       # (T, B, H, Dk)
-        k_t = k.transpose(0, 1).contiguous()       # (T, B, H, Dk)
-        v_t = v.transpose(0, 1).contiguous()       # (T, B, H, Dv)
-        alpha_t = alpha.transpose(0, 1).unsqueeze(-1).unsqueeze(-1).contiguous()  # (T, B, H, 1, 1)
-        beta_t = beta.transpose(0, 1).unsqueeze(-1).unsqueeze(-1).contiguous()    # (T, B, H, 1, 1)
+            q_t = q.transpose(0, 1).contiguous()
+            k_t = k.transpose(0, 1).contiguous()
+            v_t = v.transpose(0, 1).contiguous()
+            alpha_t = alpha.transpose(0, 1).unsqueeze(-1).unsqueeze(-1).contiguous()
+            beta_t = beta.transpose(0, 1).unsqueeze(-1).unsqueeze(-1).contiguous()
 
-        def step_fn(state, xs):
-            q_i, k_i, v_i, a_i, b_i = xs
-            new_state = a_i * state + b_i * (k_i.unsqueeze(-1) * v_i.unsqueeze(-2))
-            out_i = torch.einsum('bhk,bhkv->bhv', q_i, new_state)
-            return new_state.clone(), out_i.clone()  # clone to avoid aliasing
+            def step_fn(state, xs):
+                q_i, k_i, v_i, a_i, b_i = xs
+                new_state = a_i * state + b_i * (k_i.unsqueeze(-1) * v_i.unsqueeze(-2))
+                out_i = torch.einsum('bhk,bhkv->bhv', q_i, new_state)
+                return new_state.clone(), out_i.clone()
 
-        final_state, outputs_stacked = scan(
-            step_fn, init_state, (q_t, k_t, v_t, alpha_t, beta_t)
-        )
+            state, outputs_stacked = scan(step_fn, state, (q_t, k_t, v_t, alpha_t, beta_t))
+            output = outputs_stacked.transpose(0, 1)
+        else:
+            outputs = []
+            for t in range(T):
+                beta_t = beta[:, t, :, None, None]
+                alpha_t = alpha[:, t, :, None, None]
+                state = alpha_t * state + beta_t * (k[:, t].unsqueeze(-1) * v[:, t].unsqueeze(-2))
+                outputs.append(torch.einsum('bhk,bhkv->bhv', q[:, t], state))
+            output = torch.stack(outputs, dim=1)
 
         with torch.no_grad():
-            self.recurrent_state[:B].copy_(final_state)
+            self.recurrent_state[:B].copy_(state)
 
-        output = outputs_stacked.transpose(0, 1)  # (B, T, H, Dv)
         output = self.norm(output) * F.sigmoid(z)
         return self.out_proj(output.reshape(B, T, -1))
 
@@ -257,7 +264,7 @@ class ExportSparseMoE(nn.Module):
 
 class ExportBlock(nn.Module):
 
-    def __init__(self, config, layer_idx):
+    def __init__(self, config, layer_idx, use_scan=True):
         super().__init__()
         self.layer_type = config.layer_types[layer_idx]
         self.ln_1 = RMSNorm(config.n_embd, eps=config.rms_norm_eps)
@@ -266,7 +273,7 @@ class ExportBlock(nn.Module):
         if self.layer_type == "full_attention":
             self.attn = ExportCausalSelfAttention(config)
         else:
-            self.attn = ExportGatedDeltaNet(config)
+            self.attn = ExportGatedDeltaNet(config, use_scan=use_scan)
 
         self.mlp = ExportSparseMoE(config)
 
@@ -278,12 +285,13 @@ class ExportBlock(nn.Module):
 
 class ExportQwen35MoE(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, use_scan=True):
         super().__init__()
         self.config = config
         self.wte = nn.Embedding(config.vocab_size, config.n_embd)
         self.layers = nn.ModuleList([
-            ExportBlock(config, layer_idx=i) for i in range(config.n_layer)
+            ExportBlock(config, layer_idx=i, use_scan=use_scan)
+            for i in range(config.n_layer)
         ])
         self.ln_f = RMSNorm(config.n_embd, eps=config.rms_norm_eps)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -296,11 +304,11 @@ class ExportQwen35MoE(nn.Module):
         return self.lm_head(x)
 
     @staticmethod
-    def from_checkpoint(ckpt_path, device='cpu'):
+    def from_checkpoint(ckpt_path, device='cpu', use_scan=True):
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         config = ckpt['config']
 
-        export_model = ExportQwen35MoE(config)
+        export_model = ExportQwen35MoE(config, use_scan=use_scan)
         eager_sd = ckpt['model']
 
         # Remap eager keys → export keys, and stack per-expert weights

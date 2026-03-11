@@ -10,7 +10,7 @@ Usage:
   python inference.py
   python inference.py --mode eager --device cuda
   python inference.py --mode export_eager
-  python inference.py --mode exported
+  python inference.py --mode exported --pte nano_qwen35_moe_portable.pte
   python inference.py --prompt "MENENIUS:" --num_tokens 200
 """
 
@@ -23,7 +23,7 @@ import torch
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
 CKPT_PATH = os.path.join(_DIR, 'checkpoint/ckpt.pt')
-PTE_PATH = os.path.join(_DIR, 'nano_qwen35_moe.pte')
+PTE_PATH = os.path.join(_DIR, 'nano_qwen35_moe_portable.pte')
 DATA_DIR = os.path.join(_DIR, 'data_shakespeare_char')
 
 
