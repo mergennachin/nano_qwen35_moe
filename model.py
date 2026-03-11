@@ -280,16 +280,31 @@ class SparseMoE(nn.Module):
         weights, indices = torch.topk(weights, self.top_k, dim=-1)
         weights = weights / weights.sum(dim=-1, keepdim=True)
 
-        routed_out = torch.zeros_like(x_flat)
-        for expert_idx in range(self.n_experts):
-            mask = (indices == expert_idx)
-            if not mask.any():
-                continue
-            tok_idx, k_idx = mask.nonzero(as_tuple=True)
-            routed_out.index_add_(
-                0, tok_idx,
-                weights[tok_idx, k_idx].unsqueeze(-1) * self.experts[expert_idx](x_flat[tok_idx])
-            )
+        # Sparse expert dispatch: only run selected experts on their assigned tokens.
+        # 1. Flatten (T, top_k) into a dispatch list, sort by expert ID
+        # 2. Run each expert on its contiguous batch
+        # 3. Unsort outputs back to original order, reshape, weighted sum
+        # In production, this is a single fused CUDA kernel (vLLM's FusedMoE).
+        num_tokens = x_flat.shape[0]
+        flat_expert_ids = indices.view(-1)                               # (T*top_k,)
+        flat_token_ids = torch.arange(num_tokens, device=x.device) \
+            .unsqueeze(1).expand(-1, self.top_k).reshape(-1)            # (T*top_k,)
+
+        order = flat_expert_ids.argsort()
+        sorted_inputs = x_flat[flat_token_ids[order]]                   # grouped by expert
+
+        counts = torch.bincount(flat_expert_ids[order], minlength=self.n_experts).tolist()
+        sorted_outputs = torch.empty_like(sorted_inputs)
+        start = 0
+        for i, count in enumerate(counts):
+            if count > 0:
+                sorted_outputs[start:start + count] = self.experts[i](sorted_inputs[start:start + count])
+            start += count
+
+        # Unsort back to (T*top_k,) original order, reshape to (T, top_k, C), weighted sum
+        unsorted = torch.empty_like(sorted_outputs)
+        unsorted[order] = sorted_outputs
+        routed_out = (unsorted.view(num_tokens, self.top_k, C) * weights.unsqueeze(-1)).sum(dim=1)
 
         shared_out = self.shared_expert(x_flat)
         shared_gate = torch.sigmoid(self.shared_expert_gate(x_flat))
