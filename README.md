@@ -1,14 +1,17 @@
 # nanoQwen3.5MoE
 
-A minimal, educational implementation of the Qwen3.5 MoE (Mixture of Experts) architecture in pure PyTorch. Single-file model definition (~300 lines), trainable on CPU or GPU.
+A minimal, educational implementation of the Qwen3.5 MoE (Mixture of Experts) architecture in pure PyTorch. Single-file model definition (~300 lines), trainable on CPU or GPU, exportable to ExecuTorch.
 
 ## Files
 
 | File | Description |
 |------|-------------|
 | `model.py` | Model definition — all components in one file |
+| `export_model.py` | Export-compatible model (KV cache, GDN state buffers, stacked MoE) |
+| `export.py` | Export to ExecuTorch .pte format |
+| `inference.py` | Run inference in three modes: eager, export_eager, exported |
+| `verify_export.py` | Verify all three modes produce identical output |
 | `train.py` | Training script (Shakespeare char-level, CPU/GPU) |
-| `inference.py` | Load checkpoint and generate text |
 | `data_shakespeare_char/prepare.py` | Prepare dataset from `input.txt` |
 
 ## Architecture
@@ -56,6 +59,26 @@ L L L F L L L F    (L = GatedDeltaNet, F = Full Attention)
 | **SwiGLU MLP** | Gated FFN: `down(SiLU(gate(x)) * up(x))` -- 3 weight matrices with SiLU gating. |
 | **Sparse MoE** | Router selects top-k of N experts per token. Tokens are sorted by expert ID, batched per expert, then scattered back. A shared expert with sigmoid gate always runs on all tokens. |
 
+## Export to ExecuTorch
+
+`export_model.py` transforms the eager model for `torch.export`:
+
+| Change | Why |
+|--------|-----|
+| KV cache as registered buffers | Full-attention layers need persistent state for autoregressive decode |
+| conv_state + recurrent_state buffers | GDN layers need persistent state across tokens |
+| `torch.scan` for GDN recurrence | Replaces `for t in range(T)` loop, enabling dynamic sequence lengths |
+| Stacked expert weights `(E, H, D)` | MoE uses tensor indexing instead of data-dependent dispatch (no Python branching) |
+| `forward(tokens, input_pos)` signature | Matches ExecuTorch's LLM convention |
+
+```bash
+# Export to .pte
+python export.py
+
+# Verify all modes produce identical output
+python verify_export.py
+```
+
 ## Tiny Config vs Real Qwen3.5 MoE
 
 | Parameter | Tiny | Real |
@@ -82,8 +105,8 @@ This implementation captures the high-level architecture but simplifies several 
 | RMSNorm variant | `x * weight` | `x * (1 + weight)` (GemmaRMSNorm) |
 | Attention output gate | None | Sigmoid gate from doubled Q projection |
 | Partial rotary factor | 1.0 (full) | 0.25 (RoPE on 25% of head dims) |
-| GDN recurrence | Naive Python loop | Chunked parallel scan (FLA/FlashInfer) |
-| MoE dispatch | Sort + batch per expert | Fused CUDA kernel |
+| GDN recurrence | `torch.scan` | Chunked parallel scan (FLA/FlashInfer) |
+| MoE dispatch | Stacked weights + index | Fused CUDA kernel |
 | Parallelism | None (single device) | TP, EP, PP, sequence parallel |
 
 These simplifications mean **real Qwen3.5 checkpoints cannot be loaded** -- the GDN gating function has a different mathematical form and extra parameters (`A_log`, `dt_bias`). The model is intended for understanding the architecture, not for production inference.
@@ -91,16 +114,27 @@ These simplifications mean **real Qwen3.5 checkpoints cannot be loaded** -- the 
 ## Usage
 
 ```bash
-# Prepare data (required — generates train.bin, val.bin, and meta.pkl from input.txt)
+# Prepare data (required -- generates train.bin, val.bin, and meta.pkl from input.txt)
 python data_shakespeare_char/prepare.py
 
 # Generate text (a pre-trained checkpoint is included in the repo)
-python inference.py
-python inference.py --prompt "MENENIUS:" --num_tokens 200
-python inference.py --prompt "MENENIUS:" --num_tokens 200 --device cpu        # force CPU
-python inference.py --prompt "MENENIUS:" --num_tokens 200 --device cuda       # force GPU
+python inference.py --mode eager
+python inference.py --mode eager --prompt "MENENIUS:" --num_tokens 200
+python inference.py --mode eager --device cuda
 
-# Train from scratch (optional — auto-detects GPU)
+# Export to ExecuTorch
+python export.py
+
+# Run inference on exported model
+python inference.py --mode exported
+
+# Run inference on export-compatible model (eager, for debugging)
+python inference.py --mode export_eager
+
+# Verify all modes match
+python verify_export.py
+
+# Train from scratch (optional -- auto-detects GPU)
 python train.py
 
 # Resume training from checkpoint (set init_from = 'resume' in train.py)
@@ -112,3 +146,4 @@ python train.py
 - [vLLM Qwen3.5 implementation](https://github.com/vllm-project/vllm) -- `vllm/model_executor/models/qwen3_5.py`
 - [Gated Delta Networks](https://arxiv.org/abs/2412.06464) -- the linear attention mechanism
 - [nanoGPT](https://github.com/karpathy/nanoGPT) -- style inspiration for single-file model
+- [ExecuTorch](https://github.com/pytorch/executorch) -- on-device inference runtime
