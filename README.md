@@ -126,13 +126,13 @@ python inference.py --mode eager --prompt "MENENIUS:" --num_tokens 200
 python inference.py --mode eager --device cuda
 
 # Export to ExecuTorch
-python export.py
+python export.py                        # portable (CPU)
+python export.py --backend xnnpack      # XNNPACK
+python export.py --backend cuda         # CUDA (requires FLA Triton kernels)
 
-# Run inference on exported model
+# Run inference on exported model (Python)
 python inference.py --mode exported
-
-# Run inference on export-compatible model (eager, for debugging)
-python inference.py --mode export_eager
+python inference.py --mode export_eager  # export-compatible model in eager (for debugging)
 
 # Verify all modes match
 python verify_export.py
@@ -142,6 +142,42 @@ python train.py
 
 # Resume training from checkpoint (set init_from = 'resume' in train.py)
 python train.py
+```
+
+## C++ Runner
+
+A standalone C++ runner for running the exported .pte without Python or libtorch.
+
+### Build
+
+Requires ExecuTorch to be built first with `cmake --workflow --preset llm-release-cuda` (or `llm-release` for CPU-only).
+
+```bash
+# Build with CUDA support
+cmake --workflow --preset cuda
+
+# Build CPU-only
+cmake --workflow --preset cpu
+```
+
+### Run
+
+```bash
+# Portable (CPU)
+./build/runner --model_path nano_qwen35_moe_portable.pte \
+  --prompt "First Citizen:" --num_tokens 20
+
+# CUDA
+./build/runner --model_path nano_qwen35_moe_cuda.pte \
+  --data_path aoti_cuda_blob.ptd \
+  --prompt "First Citizen:" --num_tokens 20
+
+# Options
+./build/runner --model_path <.pte> \
+  [--data_path <.ptd>]          \  # required for CUDA backend
+  [--prompt "text"]             \  # starting text (default: "\nFirst Citizen:\n")
+  [--num_tokens 50]             \  # tokens to generate (default: 50)
+  [--temperature 0.8]              # sampling temperature, 0 = greedy (default: 0.8)
 ```
 
 ## References
