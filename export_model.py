@@ -65,6 +65,8 @@ class ExportCausalSelfAttention(nn.Module):
 
     def forward(self, x, input_pos):
         B, T, C = x.size()
+        dtype = x.dtype
+
         q = self.q_proj(x)
         k = self.k_proj(x)
         v = self.v_proj(x)
@@ -73,18 +75,18 @@ class ExportCausalSelfAttention(nn.Module):
         k = self.k_norm(k.view(B, T, self.n_kv_head, self.head_dim)).view(B, T, -1)
         q, k = self.rotary_emb(input_pos, q, k)
 
-        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        k = k.view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
+        # RMSNorm and RoPE may upcast to float32; cast back
+        q = q.to(dtype).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        k = k.to(dtype).view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
 
-        # update KV cache
         k, v = self.kv_cache.update(input_pos, k, v)
 
         if self.n_kv_groups > 1:
             k = k.repeat_interleave(self.n_kv_groups, dim=1)
             v = v.repeat_interleave(self.n_kv_groups, dim=1)
 
-        attn_mask = self.mask[input_pos]
+        attn_mask = self.mask[input_pos].unsqueeze(0).unsqueeze(0)  # (1, 1, S, max_seq)
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
 
         y = y.transpose(1, 2).contiguous().view(B, T, -1)
@@ -96,9 +98,9 @@ class ExportCausalSelfAttention(nn.Module):
 
 class ExportGatedDeltaNet(nn.Module):
 
-    def __init__(self, config, use_scan=True):
+    def __init__(self, config, use_fla=False):
         super().__init__()
-        self.use_scan = use_scan
+        self.use_fla = use_fla
         self.n_k_heads = config.linear_num_key_heads
         self.n_v_heads = config.linear_num_value_heads
         self.head_k_dim = config.linear_key_head_dim
@@ -162,11 +164,16 @@ class ExportGatedDeltaNet(nn.Module):
         v = v.view(B, T, self.n_v_heads, self.head_v_dim)
 
         # delta rule recurrence
-        # use_scan=True: torch.scan (supports dynamic T, but not all backends)
-        # use_scan=False: for loop (unrolled at trace time, requires static T)
+        # use_fla=True:  FLA Triton kernel via triton::chunk_gated_delta_rule (CUDA)
+        # use_fla=False: torch.scan (portable/xnnpack, dynamic T)
         state = self.recurrent_state[:B].clone()
 
-        if self.use_scan:
+        if self.use_fla:
+            g = torch.log(alpha + 1e-6)  # FLA expects log-space decay
+            output, state = torch.ops.triton.chunk_gated_delta_rule(
+                q, k, v, g, beta, state
+            )
+        else:
             from torch._higher_order_ops.scan import scan
 
             q_t = q.transpose(0, 1).contiguous()
@@ -175,22 +182,14 @@ class ExportGatedDeltaNet(nn.Module):
             alpha_t = alpha.transpose(0, 1).unsqueeze(-1).unsqueeze(-1).contiguous()
             beta_t = beta.transpose(0, 1).unsqueeze(-1).unsqueeze(-1).contiguous()
 
-            def step_fn(state, xs):
+            def step_fn(carry, xs):
                 q_i, k_i, v_i, a_i, b_i = xs
-                new_state = a_i * state + b_i * (k_i.unsqueeze(-1) * v_i.unsqueeze(-2))
-                out_i = torch.einsum('bhk,bhkv->bhv', q_i, new_state)
-                return new_state.clone(), out_i.clone()
+                new_carry = a_i * carry + b_i * (k_i.unsqueeze(-1) * v_i.unsqueeze(-2))
+                out_i = torch.einsum('bhk,bhkv->bhv', q_i, new_carry)
+                return new_carry.clone(), out_i.clone()
 
             state, outputs_stacked = scan(step_fn, state, (q_t, k_t, v_t, alpha_t, beta_t))
             output = outputs_stacked.transpose(0, 1)
-        else:
-            outputs = []
-            for t in range(T):
-                beta_t = beta[:, t, :, None, None]
-                alpha_t = alpha[:, t, :, None, None]
-                state = alpha_t * state + beta_t * (k[:, t].unsqueeze(-1) * v[:, t].unsqueeze(-2))
-                outputs.append(torch.einsum('bhk,bhkv->bhv', q[:, t], state))
-            output = torch.stack(outputs, dim=1)
 
         with torch.no_grad():
             self.recurrent_state[:B].copy_(state)
@@ -264,7 +263,7 @@ class ExportSparseMoE(nn.Module):
 
 class ExportBlock(nn.Module):
 
-    def __init__(self, config, layer_idx, use_scan=True):
+    def __init__(self, config, layer_idx, use_fla=False):
         super().__init__()
         self.layer_type = config.layer_types[layer_idx]
         self.ln_1 = RMSNorm(config.n_embd, eps=config.rms_norm_eps)
@@ -273,7 +272,7 @@ class ExportBlock(nn.Module):
         if self.layer_type == "full_attention":
             self.attn = ExportCausalSelfAttention(config)
         else:
-            self.attn = ExportGatedDeltaNet(config, use_scan=use_scan)
+            self.attn = ExportGatedDeltaNet(config, use_fla=use_fla)
 
         self.mlp = ExportSparseMoE(config)
 
@@ -285,12 +284,12 @@ class ExportBlock(nn.Module):
 
 class ExportQwen35MoE(nn.Module):
 
-    def __init__(self, config, use_scan=True):
+    def __init__(self, config, use_fla=False):
         super().__init__()
         self.config = config
         self.wte = nn.Embedding(config.vocab_size, config.n_embd)
         self.layers = nn.ModuleList([
-            ExportBlock(config, layer_idx=i, use_scan=use_scan)
+            ExportBlock(config, layer_idx=i, use_fla=use_fla)
             for i in range(config.n_layer)
         ])
         self.ln_f = RMSNorm(config.n_embd, eps=config.rms_norm_eps)
@@ -304,11 +303,11 @@ class ExportQwen35MoE(nn.Module):
         return self.lm_head(x)
 
     @staticmethod
-    def from_checkpoint(ckpt_path, device='cpu', use_scan=True):
+    def from_checkpoint(ckpt_path, device='cpu', use_fla=False):
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         config = ckpt['config']
 
-        export_model = ExportQwen35MoE(config, use_scan=use_scan)
+        export_model = ExportQwen35MoE(config, use_fla=use_fla)
         eager_sd = ckpt['model']
 
         # Remap eager keys → export keys, and stack per-expert weights

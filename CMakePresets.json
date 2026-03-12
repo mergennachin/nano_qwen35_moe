@@ -1,0 +1,55 @@
+{
+    "version": 6,
+    "configurePresets": [
+        {
+            "name": "base",
+            "hidden": true,
+            "binaryDir": "${sourceDir}/build",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "EXECUTORCH_ROOT": "${sourceDir}/../executorch"
+            }
+        },
+        {
+            "name": "cpu",
+            "displayName": "Runner (CPU/portable)",
+            "inherits": ["base"]
+        },
+        {
+            "name": "cuda",
+            "displayName": "Runner (CUDA)",
+            "inherits": ["base"],
+            "cacheVariables": {
+                "EXECUTORCH_BUILD_CUDA": "ON"
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "cpu",
+            "configurePreset": "cpu",
+            "targets": ["runner"]
+        },
+        {
+            "name": "cuda",
+            "configurePreset": "cuda",
+            "targets": ["runner"]
+        }
+    ],
+    "workflowPresets": [
+        {
+            "name": "cpu",
+            "steps": [
+                {"type": "configure", "name": "cpu"},
+                {"type": "build", "name": "cpu"}
+            ]
+        },
+        {
+            "name": "cuda",
+            "steps": [
+                {"type": "configure", "name": "cuda"},
+                {"type": "build", "name": "cuda"}
+            ]
+        }
+    ]
+}
