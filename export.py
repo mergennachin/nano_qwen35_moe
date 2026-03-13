@@ -7,6 +7,7 @@ Usage:
   python export.py --backend cuda         # CUDA (uses FLA Triton kernels for GDN)
 """
 
+import contextlib
 import os
 import argparse
 
@@ -54,20 +55,20 @@ def main():
     print(f"Model: {config.n_layer} layers, {config.n_embd}d, "
           f"{config.n_routed_experts} experts top-{config.n_experts_per_tok}")
 
-    if is_cuda:
-        # CUDA/AOTI: static shapes (single-token decode)
-        example_tokens = torch.tensor([[0]], dtype=torch.long, device=device)
-        example_input_pos = torch.tensor([0], dtype=torch.long, device=device)
-        dynamic_shapes = None
-    else:
-        # Portable/XNNPACK: dynamic shapes via torch.scan
-        example_tokens = torch.tensor([[0, 1]], dtype=torch.long, device=device)
-        example_input_pos = torch.tensor([0, 1], dtype=torch.long, device=device)
-        seq_dim = Dim("seq_len", min=1, max=config.block_size - 1)
-        dynamic_shapes = ({1: seq_dim}, {0: seq_dim})
+    # Dynamic shapes for all backends (CUDA uses FLA Triton kernel instead of
+    # torch.scan for GDN, so dynamic seq_len works fine)
+    example_tokens = torch.tensor([[0, 1]], dtype=torch.long, device=device)
+    example_input_pos = torch.tensor([0, 1], dtype=torch.long, device=device)
+    seq_dim = Dim("seq_len", min=1, max=config.block_size - 1)
+    dynamic_shapes = ({1: seq_dim}, {0: seq_dim})
 
     print("Exporting with torch.export...")
-    with torch.no_grad(), sdpa_kernel([SDPBackend.MATH]):
+    # CUDA/AOTI: export without MATH decomposition so AOTInductor selects
+    # efficient SDPA kernels (FlashAttention / memory-efficient attention).
+    # The bool causal mask is already compatible with CUDA's Triton SDPA kernel.
+    # Portable/XNNPACK: decompose SDPA via MATH backend for portable ops.
+    ctx = contextlib.nullcontext() if is_cuda else sdpa_kernel([SDPBackend.MATH])
+    with torch.no_grad(), ctx:
         exported = export(
             model,
             (example_tokens, example_input_pos),
