@@ -5,6 +5,7 @@ Usage:
   python export.py                        # portable (CPU)
   python export.py --backend xnnpack      # XNNPACK
   python export.py --backend cuda         # CUDA (uses FLA Triton kernels for GDN)
+  python export.py --backend cuda --qlinear 4w --qlinear-packing-format tile_packed_to_4d  # CUDA int4
 """
 
 import contextlib
@@ -12,6 +13,7 @@ import os
 import argparse
 
 import torch
+import torch.nn as nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.export import Dim, export
 from executorch.exir import (
@@ -32,6 +34,15 @@ def main():
     parser.add_argument('--checkpoint', default=os.path.join(_DIR, 'checkpoint/ckpt.pt'))
     parser.add_argument('--output', default=None)
     parser.add_argument('--backend', default='portable', choices=['portable', 'xnnpack', 'cuda'])
+    parser.add_argument('--qlinear', default=None, choices=['4w', '8w', '8da4w', '8da8w'],
+                        help='Quantize linear layers.')
+    parser.add_argument('--qlinear-group-size', type=int, default=32,
+                        help='Group size for linear quantization (default: 32).')
+    parser.add_argument('--qlinear-packing-format', default=None,
+                        choices=['tile_packed_to_4d'],
+                        help='Packing format for 4w quantization (CUDA: tile_packed_to_4d).')
+    parser.add_argument('--qembedding', default=None, choices=['8w'],
+                        help='Quantize embedding layers (8-bit weight-only).')
     args = parser.parse_args()
 
     if args.output is None:
@@ -54,6 +65,27 @@ def main():
     model.eval()
     print(f"Model: {config.n_layer} layers, {config.n_embd}d, "
           f"{config.n_routed_experts} experts top-{config.n_experts_per_tok}")
+
+    # Quantize before export
+    if args.qlinear or args.qembedding:
+        from executorch.extension.llm.export.quantize import quantize_model_
+
+        # Untie lm_head/embedding so each gets its own quantization config
+        if model.lm_head.weight.data_ptr() == model.wte.weight.data_ptr():
+            model.lm_head.weight = nn.Parameter(model.wte.weight.clone())
+
+        if args.qlinear:
+            print(f"Quantizing linear layers ({args.qlinear})...")
+            quantize_model_(
+                model,
+                qlinear_config=args.qlinear,
+                qlinear_group_size=args.qlinear_group_size,
+                qlinear_packing_format=args.qlinear_packing_format,
+            )
+
+        if args.qembedding:
+            print(f"Quantizing embeddings ({args.qembedding})...")
+            quantize_model_(model, qembedding_config=args.qembedding)
 
     # Dynamic shapes for all backends (CUDA uses FLA Triton kernel instead of
     # torch.scan for GDN, so dynamic seq_len works fine)
