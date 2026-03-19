@@ -7,8 +7,8 @@ A minimal, educational implementation of the Qwen3.5 MoE (Mixture of Experts) ar
 | File | Description |
 |------|-------------|
 | `model.py` | Model definition — all components in one file |
-| `export_model.py` | Export-compatible model (KV cache, GDN state buffers, stacked MoE) |
-| `export.py` | Export to ExecuTorch .pte format |
+| `export_model.py` | Export-compatible model (KV cache, GDN state buffers, grouped MoE experts) |
+| `export.py` | Export to ExecuTorch .pte format (portable, XNNPACK, CUDA) |
 | `inference.py` | Run inference in three modes: eager, export_eager, exported |
 | `verify_export.py` | Verify all three modes produce identical output |
 | `train.py` | Training script (Shakespeare char-level, CPU/GPU) |
@@ -52,12 +52,13 @@ L L L F L L L F    (L = GatedDeltaNet, F = Full Attention)
 
 | Component | Description |
 |-----------|-------------|
-| **RMSNorm** | Normalization without mean subtraction: `x / sqrt(mean(x^2) + eps) * weight` |
-| **RoPE** | Rotary Position Embeddings -- parameter-free position encoding via rotation of Q,K vectors. Only used in full-attention layers. |
-| **Full Attention (GQA + QK-Norm)** | Grouped Query Attention with fewer KV heads than Q heads. RMSNorm applied per-head to Q and K before RoPE. Used on 25% of layers for precise token-to-token matching. |
-| **GatedDeltaNet** | Linear attention via recurrent state matrix. Causal conv1d provides local position context. Delta rule: `state = gate * state + beta * outer(k, v)`, read: `out = q @ state`. O(n) per token. Used on 75% of layers. |
-| **SwiGLU MLP** | Gated FFN: `down(SiLU(gate(x)) * up(x))` -- 3 weight matrices with SiLU gating. |
-| **Sparse MoE** | Router selects top-k of N experts per token. Tokens are sorted by expert ID, batched per expert, then scattered back. A shared expert with sigmoid gate always runs on all tokens. |
+| **Gemma-style RMSNorm** | `x / sqrt(mean(x^2) + eps) * (1 + weight)` — weight initialized to zeros so effective scale starts at 1. |
+| **RMSNormGated** | `weight * RMSNorm(x) * silu(z)` — used in GatedDeltaNet output with SiLU gating. |
+| **Partial RoPE** | Rotary Position Embeddings on first `partial_rotary_factor` (25%) of head dimensions. Only used in full-attention layers. |
+| **Full Attention (GQA + QK-Norm + Output Gate)** | GQA with fewer KV heads. RMSNorm per-head on Q,K before RoPE. Q projection produces Q + gate; output = `attn_output * sigmoid(gate)`. |
+| **GatedDeltaNet** | Linear attention via recurrent state matrix. Causal conv1d for local context. L2-normalized Q,K. Mamba-style decay: `g = -exp(A_log) * softplus(a + dt_bias)` with learned `A_log` and `dt_bias`. |
+| **SwiGLU MLP** | Gated FFN: `down(SiLU(gate(x)) * up(x))` — 3 weight matrices with SiLU gating. |
+| **Sparse MoE** | Router selects top-k of N experts per token. Shared expert with sigmoid gate always runs. |
 
 ## Export to ExecuTorch
 
@@ -68,7 +69,7 @@ L L L F L L L F    (L = GatedDeltaNet, F = Full Attention)
 | KV cache as registered buffers | Full-attention layers need persistent state for autoregressive decode |
 | conv_state + recurrent_state buffers | GDN layers need persistent state across tokens |
 | `torch.scan` for GDN recurrence | Replaces `for t in range(T)` loop, enabling dynamic sequence lengths |
-| Stacked expert weights `(E, H, D)` | MoE uses tensor indexing instead of data-dependent dispatch (no Python branching) |
+| Grouped nn.Linear experts | Expert weights as nn.Linear for `quantize_model_()` compatibility. Groups keep each linear small enough for tinygemm int4 packing. |
 | `forward(tokens, input_pos)` signature | Matches ExecuTorch's LLM convention |
 
 ```bash
@@ -78,41 +79,46 @@ python export.py
 # Export with XNNPACK backend
 python export.py --backend xnnpack
 
+# Export with CUDA backend + int4 quantization
+python export.py --backend cuda --qlinear 4w --qlinear-packing-format tile_packed_to_4d --qembedding 8w
+
 # Verify all modes produce identical output
 python verify_export.py
 ```
+
+### Export design
+
+`export.py` is split into `load_and_quantize()` and `export_and_lower()`:
+
+- **`load_and_quantize(args)`** — loads checkpoint, quantizes layer-by-layer on CUDA (each layer moved to CUDA, quantized, moved back to CPU). Peak GPU = 1 bf16 layer. Returns model on CPU.
+- **`export_and_lower(model, config, args)`** — `torch.export` traces on CPU (doesn't execute ops), then lowers to the selected backend.
+
+This separation lets you iterate on export without re-quantizing, and test the quantized model eagerly before committing to a full export.
 
 ## Tiny Config vs Real Qwen3.5 MoE
 
 | Parameter | Tiny | Real |
 |-----------|------|------|
 | `n_embd` | 64 | 2048 |
-| `n_layer` | 4 | 40 |
+| `n_layer` | 8 | 40 |
 | `n_head` / `n_kv_head` | 4 / 2 | 16 / 2 |
-| `n_routed_experts` | 4 | 256 |
+| `head_dim` | 16 | 256 |
+| `partial_rotary_factor` | 0.25 | 0.25 |
+| `n_routed_experts` | 8 | 256 |
 | `n_experts_per_tok` | 2 | 8 |
 | `full_attention_interval` | 4 | 4 |
-| `expert_intermediate / n_embd` | 0.5 | 0.25 |
-| `shared / expert intermediate` | 1:1 | 1:1 |
 | `linear_conv_kernel_dim` | 4 | 4 |
-| Total parameters | ~210K | ~billions |
+| Total parameters | ~420K | ~35B |
 
-## Simplifications vs Reference (vLLM)
+## Differences from Production
 
-This implementation captures the high-level architecture but simplifies several components for clarity:
-
-| Feature | This Implementation | Real Qwen3.5 (vLLM) |
+| Feature | This Implementation | Production (vLLM/ExecuTorch) |
 |---------|-------------------|---------------------|
-| GDN decay gate | `sigmoid(linear(x))` | Mamba-style: `exp(-exp(A_log) * softplus(a + dt_bias))` with 2 extra learned params |
-| GDN output gate | `RMSNorm(out) * sigmoid(z)` | `GemmaRMSNorm(out) * SiLU(z)` |
-| RMSNorm variant | `x * weight` | `x * (1 + weight)` (GemmaRMSNorm) |
-| Attention output gate | None | Sigmoid gate from doubled Q projection |
-| Partial rotary factor | 1.0 (full) | 0.25 (RoPE on 25% of head dims) |
-| GDN recurrence | `torch.scan` | Chunked parallel scan (FLA/FlashInfer) |
-| MoE dispatch | Stacked weights + index | Fused CUDA kernel |
+| GDN recurrence | `torch.scan` (portable) or FLA Triton kernel (CUDA) | Chunked parallel scan (FLA/FlashInfer) |
+| MoE dispatch | Grouped nn.Linear + gather | Fused CUDA kernel (FusedMoE) |
 | Parallelism | None (single device) | TP, EP, PP, sequence parallel |
 
-These simplifications mean **real Qwen3.5 checkpoints cannot be loaded** -- the GDN gating function has a different mathematical form and extra parameters (`A_log`, `dt_bias`). The model is intended for understanding the architecture, not for production inference.
+The architecture (norms, gating, attention, RoPE) matches the HF reference (`transformers/models/qwen3_5_moe/`) exactly. Real Qwen3.5 checkpoints can be loaded with appropriate key remapping — see `executorch/examples/models/qwen3_5_moe/` for the full-size model.
 
 ## Usage
 
@@ -182,7 +188,8 @@ cmake --workflow --preset cpu
 
 ## References
 
-- [vLLM Qwen3.5 implementation](https://github.com/vllm-project/vllm) -- `vllm/model_executor/models/qwen3_5.py`
-- [Gated Delta Networks](https://arxiv.org/abs/2412.06464) -- the linear attention mechanism
-- [nanoGPT](https://github.com/karpathy/nanoGPT) -- style inspiration for single-file model
-- [ExecuTorch](https://github.com/pytorch/executorch) -- on-device inference runtime
+- [HF Transformers Qwen3.5 MoE](https://github.com/huggingface/transformers) — `transformers/models/qwen3_5_moe/`
+- [vLLM Qwen3.5 implementation](https://github.com/vllm-project/vllm) — `vllm/model_executor/models/qwen3_5.py`
+- [Gated Delta Networks](https://arxiv.org/abs/2412.06464) — the linear attention mechanism
+- [nanoGPT](https://github.com/karpathy/nanoGPT) — style inspiration for single-file model
+- [ExecuTorch](https://github.com/pytorch/executorch) — on-device inference runtime

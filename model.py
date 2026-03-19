@@ -5,12 +5,11 @@ Architecture overview:
   - Hybrid attention: 75% GatedDeltaNet (linear O(n)), 25% full softmax attention
   - Mixture of Experts (MoE) on every layer: router selects top-k of N experts
   - Shared expert: always-on expert with sigmoid gate
-  - RMSNorm, RoPE, GQA with QK-Norm, SwiGLU activation
+  - Gemma-style RMSNorm (1 + weight), partial RoPE, GQA with QK-Norm + output gate
 
-Reference: vLLM's Qwen3.5 MoE implementation
-  vllm/model_executor/models/qwen3_5.py
-  vllm/model_executor/models/qwen3_next.py
-  vllm/transformers_utils/configs/qwen3_5_moe.py
+Reference:
+  - HF transformers: models/qwen3_5_moe/modeling_qwen3_5_moe.py
+  - vLLM: vllm/model_executor/models/qwen3_5.py
 """
 
 import math
@@ -32,6 +31,7 @@ class Qwen35MoEConfig:
     n_head: int = 4
     n_kv_head: int = 2
     head_dim: int = 16
+    partial_rotary_factor: float = 0.25
 
     # GatedDeltaNet / linear attention (used on remaining layers)
     linear_num_key_heads: int = 4
@@ -64,60 +64,78 @@ class Qwen35MoEConfig:
 
 
 # ---------------------------------------------------------------------------
-# RMSNorm — simpler than LayerNorm: no mean subtraction, no bias.
-# Formula: y = x / sqrt(mean(x²) + eps) * weight
+# Gemma-style RMSNorm: y = x / sqrt(mean(x²) + eps) * (1 + weight)
+# Weight initialized to zeros so effective scale starts at 1.
 
 class RMSNorm(nn.Module):
+
+    def __init__(self, ndim, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(ndim))
+        self.eps = eps
+
+    def forward(self, x):
+        x_float = x.float()
+        normed = x_float * torch.rsqrt(x_float.pow(2).mean(-1, keepdim=True) + self.eps)
+        return (normed * (1.0 + self.weight.float())).type_as(x)
+
+
+class RMSNormGated(nn.Module):
+    """RMSNorm(x) * silu(z) — used in GatedDeltaNet output."""
 
     def __init__(self, ndim, eps=1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(ndim))
         self.eps = eps
 
-    def forward(self, x):
-        dtype = x.dtype
-        rms = x.float().pow(2).mean(-1, keepdim=True)
-        x = x.float() * torch.rsqrt(rms + self.eps)
-        return (x * self.weight).to(dtype)
+    def forward(self, x, z):
+        x_float = x.float()
+        normed = x_float * torch.rsqrt(x_float.pow(2).mean(-1, keepdim=True) + self.eps)
+        normed = (self.weight * normed.type_as(x))
+        return (normed * F.silu(z.float())).type_as(x)
 
 
 # ---------------------------------------------------------------------------
-# Rotary Position Embeddings — parameter-free, encodes position by rotating
-# Q and K vectors. Only used in full-attention layers; GDN layers use conv1d.
+# Partial Rotary Position Embeddings — only rotates first rotary_dim
+# dimensions of each head, passes through the rest.
 
 class RotaryEmbedding(nn.Module):
 
-    def __init__(self, head_dim, rope_theta=10000.0):
+    def __init__(self, head_dim, partial_rotary_factor=1.0, rope_theta=10000.0):
         super().__init__()
         self.head_dim = head_dim
+        self.rotary_dim = int(head_dim * partial_rotary_factor)
         inv_freq = 1.0 / (rope_theta ** (
-            torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim
+            torch.arange(0, self.rotary_dim, 2, dtype=torch.float32) / self.rotary_dim
         ))
         self.register_buffer("inv_freq", inv_freq)
 
     def forward(self, positions, q, k):
+        # q: (B, T, n_heads, head_dim), k: (B, T, n_kv_heads, head_dim)
         freqs = torch.outer(positions.float(), self.inv_freq)
-        emb = torch.cat([freqs, freqs], dim=-1)
-        cos, sin = emb.cos(), emb.sin()
-        return self._rotate(q, cos, sin), self._rotate(k, cos, sin)
+        cos = freqs.cos().unsqueeze(1)  # (T, 1, rotary_dim/2)
+        sin = freqs.sin().unsqueeze(1)
 
-    def _rotate(self, x, cos, sin):
-        shape = x.shape
-        x = x.view(*shape[:-1], -1, self.head_dim)
-        x1, x2 = x[..., :self.head_dim//2], x[..., self.head_dim//2:]
-        cos = cos.unsqueeze(-2)
-        sin = sin.unsqueeze(-2)
-        c1, c2 = cos[..., :self.head_dim//2], cos[..., self.head_dim//2:]
-        s1, s2 = sin[..., :self.head_dim//2], sin[..., self.head_dim//2:]
-        o1 = x1 * c1 - x2 * s1
-        o2 = x2 * c2 + x1 * s2
-        return torch.cat([o1, o2], dim=-1).view(shape)
+        q_rot, q_pass = q[..., :self.rotary_dim], q[..., self.rotary_dim:]
+        k_rot, k_pass = k[..., :self.rotary_dim], k[..., self.rotary_dim:]
+
+        q_rot = self._apply_rotary(q_rot, cos, sin)
+        k_rot = self._apply_rotary(k_rot, cos, sin)
+
+        q = torch.cat([q_rot, q_pass], dim=-1)
+        k = torch.cat([k_rot, k_pass], dim=-1)
+        return q, k
+
+    @staticmethod
+    def _apply_rotary(x, cos, sin):
+        half = x.shape[-1] // 2
+        x1, x2 = x[..., :half], x[..., half:]
+        return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
 
 
 # ---------------------------------------------------------------------------
-# Full Attention with GQA + QK-Norm + RoPE
-# Used on 25% of layers (every full_attention_interval-th).
-# O(n²) per token — precise token-to-token matching.
+# Full Attention with GQA + QK-Norm + partial RoPE + output gate.
+# q_proj produces Q and gate (2x heads). Output = attn_output * sigmoid(gate).
 
 class CausalSelfAttention(nn.Module):
 
@@ -128,29 +146,35 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = config.head_dim
         self.n_kv_groups = self.n_head // self.n_kv_head
 
-        self.q_proj = nn.Linear(config.n_embd, self.n_head * self.head_dim, bias=False)
+        # q_proj includes output gate: 2x heads
+        self.q_proj = nn.Linear(config.n_embd, self.n_head * self.head_dim * 2, bias=False)
         self.k_proj = nn.Linear(config.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.v_proj = nn.Linear(config.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.n_head * self.head_dim, config.n_embd, bias=False)
 
-        # QK-Norm: RMSNorm per head on Q and K before RoPE
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.rotary_emb = RotaryEmbedding(self.head_dim, config.rope_theta)
+        self.rotary_emb = RotaryEmbedding(
+            self.head_dim, config.partial_rotary_factor, config.rope_theta,
+        )
 
     def forward(self, x, positions):
-        B, T, C = x.size()
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
+        B, T, _ = x.size()
 
-        q = self.q_norm(q.view(B, T, self.n_head, self.head_dim)).view(B, T, -1)
-        k = self.k_norm(k.view(B, T, self.n_kv_head, self.head_dim)).view(B, T, -1)
+        q_and_gate = self.q_proj(x).view(B, T, self.n_head, self.head_dim * 2)
+        q = q_and_gate[..., :self.head_dim]
+        gate = q_and_gate[..., self.head_dim:]
+
+        k = self.k_proj(x).view(B, T, self.n_kv_head, self.head_dim)
+        v = self.v_proj(x).view(B, T, self.n_kv_head, self.head_dim)
+
+        q = self.q_norm(q)
+        k = self.k_norm(k)
         q, k = self.rotary_emb(positions, q, k)
 
-        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        k = k.view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
-        v = v.view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
+        q = q.type_as(x).transpose(1, 2)
+        k = k.type_as(x).transpose(1, 2)
+        v = v.transpose(1, 2)
 
         if self.n_kv_groups > 1:
             k = k.repeat_interleave(self.n_kv_groups, dim=1)
@@ -158,6 +182,11 @@ class CausalSelfAttention(nn.Module):
 
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         y = y.transpose(1, 2).contiguous().view(B, T, -1)
+
+        # Output gate
+        gate = gate.reshape(B, T, -1)
+        y = y * torch.sigmoid(gate)
+
         return self.o_proj(y)
 
 
@@ -167,9 +196,9 @@ class CausalSelfAttention(nn.Module):
 #
 # Recurrence (per head, per token t):
 #   q, k    = L2norm(Q[t]), L2norm(K[t])
-#   gate    = sigmoid(alpha[t])       — how much to retain old state
-#   beta_t  = sigmoid(beta[t])        — how strongly to write new info
-#   state   = gate * state + beta_t * outer(k, v)
+#   beta_t  = sigmoid(beta[t])          — how strongly to write new info
+#   g_t     = -exp(A_log) * softplus(a + dt_bias)  — Mamba-style decay
+#   state   = exp(g_t) * state + beta_t * outer(k, v)
 #   out[t]  = q @ state
 #
 # Position info comes from causal conv1d on QKV (not RoPE).
@@ -185,29 +214,34 @@ class GatedDeltaNet(nn.Module):
         self.key_dim = self.n_k_heads * self.head_k_dim
         self.value_dim = self.n_v_heads * self.head_v_dim
 
+        assert self.n_v_heads % self.n_k_heads == 0
+        self.head_repeat = self.n_v_heads // self.n_k_heads
+
         qkv_dim = self.key_dim * 2 + self.value_dim
-        self.in_proj_qkvz = nn.Linear(config.n_embd, qkv_dim + self.value_dim, bias=False)
+        self.in_proj_qkv = nn.Linear(config.n_embd, qkv_dim, bias=False)
+        self.in_proj_z = nn.Linear(config.n_embd, self.value_dim, bias=False)
         self.in_proj_b = nn.Linear(config.n_embd, self.n_v_heads, bias=False)
         self.in_proj_a = nn.Linear(config.n_embd, self.n_v_heads, bias=False)
 
-        # Depthwise causal conv1d gives local positional context
         self.conv1d = nn.Conv1d(
             qkv_dim, qkv_dim, config.linear_conv_kernel_dim,
             groups=qkv_dim, padding=config.linear_conv_kernel_dim - 1, bias=False,
         )
 
-        self.norm = RMSNorm(self.head_v_dim, eps=config.rms_norm_eps)
+        self.dt_bias = nn.Parameter(torch.ones(self.n_v_heads))
+        A = torch.empty(self.n_v_heads).uniform_(0, 16)
+        self.A_log = nn.Parameter(torch.log(A))
+
+        self.norm = RMSNormGated(self.head_v_dim, eps=config.rms_norm_eps)
         self.out_proj = nn.Linear(self.value_dim, config.n_embd, bias=False)
 
     def forward(self, x, positions):
         B, T, C = x.size()
 
-        qkvz = self.in_proj_qkvz(x)
-        qkv, z = qkvz.split([self.key_dim * 2 + self.value_dim, self.value_dim], dim=-1)
-        z = z.view(B, T, self.n_v_heads, self.head_v_dim)
-
-        beta = torch.sigmoid(self.in_proj_b(x))
-        alpha = torch.sigmoid(self.in_proj_a(x))
+        qkv = self.in_proj_qkv(x)
+        z = self.in_proj_z(x).view(B, T, self.n_v_heads, self.head_v_dim)
+        b = self.in_proj_b(x)
+        a = self.in_proj_a(x)
 
         # Causal conv1d + SiLU activation
         qkv = qkv.transpose(1, 2)
@@ -220,20 +254,35 @@ class GatedDeltaNet(nn.Module):
         k = F.normalize(k.view(B, T, self.n_k_heads, self.head_k_dim), p=2, dim=-1)
         v = v.view(B, T, self.n_v_heads, self.head_v_dim)
 
-        # Delta rule recurrence
-        n_heads = self.n_k_heads
-        state = torch.zeros(B, n_heads, self.head_k_dim, self.head_v_dim,
+        if self.head_repeat > 1:
+            q = q.repeat_interleave(self.head_repeat, dim=2)
+            k = k.repeat_interleave(self.head_repeat, dim=2)
+
+        # Mamba-style gating
+        beta = b.sigmoid()
+        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+
+        # Delta rule recurrence (per-token loop for training)
+        state = torch.zeros(B, self.n_v_heads, self.head_k_dim, self.head_v_dim,
                             device=x.device, dtype=x.dtype)
         outputs = []
         for t in range(T):
             beta_t = beta[:, t, :, None, None]
-            alpha_t = alpha[:, t, :, None, None]
-            state = alpha_t * state + beta_t * (k[:, t].unsqueeze(-1) * v[:, t].unsqueeze(-2))
+            g_t = g[:, t, :, None, None]
+            state = torch.exp(g_t) * state + beta_t * (
+                k[:, t].unsqueeze(-1) * v[:, t].unsqueeze(-2)
+            )
             outputs.append(torch.einsum('bhk,bhkv->bhv', q[:, t], state))
 
         output = torch.stack(outputs, dim=1)
-        output = self.norm(output) * F.sigmoid(z)
-        return self.out_proj(output.reshape(B, T, -1))
+
+        # RMSNorm(output) * silu(z)
+        output = output.reshape(-1, self.head_v_dim)
+        z = z.reshape(-1, self.head_v_dim)
+        output = self.norm(output, z)
+        output = output.reshape(B, T, -1)
+
+        return self.out_proj(output)
 
 
 # ---------------------------------------------------------------------------
@@ -282,17 +331,13 @@ class SparseMoE(nn.Module):
         weights = weights / weights.sum(dim=-1, keepdim=True)
 
         # Sparse expert dispatch: only run selected experts on their assigned tokens.
-        # 1. Flatten (T, top_k) into a dispatch list, sort by expert ID
-        # 2. Run each expert on its contiguous batch
-        # 3. Unsort outputs back to original order, reshape, weighted sum
-        # In production, this is a single fused CUDA kernel (vLLM's FusedMoE).
         num_tokens = x_flat.shape[0]
-        flat_expert_ids = indices.view(-1)                               # (T*top_k,)
+        flat_expert_ids = indices.view(-1)
         flat_token_ids = torch.arange(num_tokens, device=x.device) \
-            .unsqueeze(1).expand(-1, self.top_k).reshape(-1)            # (T*top_k,)
+            .unsqueeze(1).expand(-1, self.top_k).reshape(-1)
 
         order = flat_expert_ids.argsort()
-        sorted_inputs = x_flat[flat_token_ids[order]]                   # grouped by expert
+        sorted_inputs = x_flat[flat_token_ids[order]]
 
         counts = torch.bincount(flat_expert_ids[order], minlength=self.n_experts).tolist()
         sorted_outputs = torch.empty_like(sorted_inputs)
@@ -302,7 +347,6 @@ class SparseMoE(nn.Module):
                 sorted_outputs[start:start + count] = self.experts[i](sorted_inputs[start:start + count])
             start += count
 
-        # Unsort back to (T*top_k,) original order, reshape to (T, top_k, C), weighted sum
         unsorted = torch.empty_like(sorted_outputs)
         unsorted[order] = sorted_outputs
         routed_out = (unsorted.view(num_tokens, self.top_k, C) * weights.unsqueeze(-1)).sum(dim=1)

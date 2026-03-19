@@ -5,15 +5,17 @@ Transforms the eager model.py into a version that torch.export can trace:
   - forward(tokens, input_pos) signature for autoregressive decode
   - KV cache as registered buffers for full-attention layers
   - conv_state + recurrent_state as registered buffers for GDN layers
-  - Export-friendly MoE dispatch (all-experts + gather, no data-dependent branching)
+  - Export-friendly MoE: grouped nn.Linear experts (quantization-compatible)
 
-Reference: executorch/examples/models/llama/attention.py (KVCache, AttentionGatedDeltaNet)
+Reference: executorch/examples/models/qwen3_5_moe/ (full-size model)
 """
+
+import re
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from model import Qwen35MoEConfig, RMSNorm, RotaryEmbedding, MLP
+from model import Qwen35MoEConfig, RMSNorm, RMSNormGated, RotaryEmbedding, MLP
 
 
 # ---------------------------------------------------------------------------
@@ -23,21 +25,17 @@ class KVCache(nn.Module):
 
     def __init__(self, n_heads, head_dim, max_seq_len):
         super().__init__()
-        self.max_seq_len = max_seq_len
         self.register_buffer("k_cache", torch.zeros(1, n_heads, max_seq_len, head_dim))
         self.register_buffer("v_cache", torch.zeros(1, n_heads, max_seq_len, head_dim))
 
     def update(self, input_pos, k_val, v_val):
-        # input_pos: (S,), k_val/v_val: (1, H, S, D)
-        k_out = self.k_cache
-        v_out = self.v_cache
-        k_out[:, :, input_pos] = k_val
-        v_out[:, :, input_pos] = v_val
-        return k_out, v_out
+        self.k_cache[:, :, input_pos] = k_val
+        self.v_cache[:, :, input_pos] = v_val
+        return self.k_cache, self.v_cache
 
 
 # ---------------------------------------------------------------------------
-# Full Attention with KV cache
+# Full Attention with KV cache + output gate
 
 class ExportCausalSelfAttention(nn.Module):
 
@@ -48,37 +46,40 @@ class ExportCausalSelfAttention(nn.Module):
         self.head_dim = config.head_dim
         self.n_kv_groups = self.n_head // self.n_kv_head
 
-        self.q_proj = nn.Linear(config.n_embd, self.n_head * self.head_dim, bias=False)
+        # q_proj includes output gate: 2x heads
+        self.q_proj = nn.Linear(config.n_embd, self.n_head * self.head_dim * 2, bias=False)
         self.k_proj = nn.Linear(config.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.v_proj = nn.Linear(config.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.n_head * self.head_dim, config.n_embd, bias=False)
 
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.rotary_emb = RotaryEmbedding(self.head_dim, config.rope_theta)
+        self.rotary_emb = RotaryEmbedding(
+            self.head_dim, config.partial_rotary_factor, config.rope_theta,
+        )
 
         self.kv_cache = KVCache(self.n_kv_head, self.head_dim, config.block_size)
-
-        # pre-registered causal mask
         mask = torch.tril(torch.ones(config.block_size, config.block_size, dtype=torch.bool))
         self.register_buffer("mask", mask)
 
     def forward(self, x, input_pos):
-        B, T, C = x.size()
+        B, T, _ = x.size()
         dtype = x.dtype
 
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
+        q_and_gate = self.q_proj(x).view(B, T, self.n_head, self.head_dim * 2)
+        q = q_and_gate[..., :self.head_dim]
+        gate = q_and_gate[..., self.head_dim:]
 
-        q = self.q_norm(q.view(B, T, self.n_head, self.head_dim)).view(B, T, -1)
-        k = self.k_norm(k.view(B, T, self.n_kv_head, self.head_dim)).view(B, T, -1)
+        k = self.k_proj(x).view(B, T, self.n_kv_head, self.head_dim)
+        v = self.v_proj(x).view(B, T, self.n_kv_head, self.head_dim)
+
+        q = self.q_norm(q)
+        k = self.k_norm(k)
         q, k = self.rotary_emb(input_pos, q, k)
 
-        # RMSNorm and RoPE may upcast to float32; cast back
-        q = q.to(dtype).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        k = k.to(dtype).view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
-        v = v.view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
+        q = q.to(dtype).transpose(1, 2)
+        k = k.to(dtype).transpose(1, 2)
+        v = v.transpose(1, 2)
 
         k, v = self.kv_cache.update(input_pos, k, v)
 
@@ -86,10 +87,14 @@ class ExportCausalSelfAttention(nn.Module):
             k = k.repeat_interleave(self.n_kv_groups, dim=1)
             v = v.repeat_interleave(self.n_kv_groups, dim=1)
 
-        attn_mask = self.mask[input_pos].unsqueeze(0).unsqueeze(0)  # (1, 1, S, max_seq)
+        attn_mask = self.mask[input_pos].unsqueeze(0).unsqueeze(0)
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
 
         y = y.transpose(1, 2).contiguous().view(B, T, -1)
+
+        gate = gate.reshape(B, T, -1)
+        y = y * torch.sigmoid(gate)
+
         return self.o_proj(y)
 
 
@@ -109,67 +114,81 @@ class ExportGatedDeltaNet(nn.Module):
         self.value_dim = self.n_v_heads * self.head_v_dim
         self.conv_kernel_size = config.linear_conv_kernel_dim
 
+        assert self.n_v_heads % self.n_k_heads == 0
+        self.head_repeat = self.n_v_heads // self.n_k_heads
+
         self.conv_dim = self.key_dim * 2 + self.value_dim
-        self.in_proj_qkvz = nn.Linear(config.n_embd, self.conv_dim + self.value_dim, bias=False)
+        self.in_proj_qkv = nn.Linear(config.n_embd, self.conv_dim, bias=False)
+        self.in_proj_z = nn.Linear(config.n_embd, self.value_dim, bias=False)
         self.in_proj_b = nn.Linear(config.n_embd, self.n_v_heads, bias=False)
         self.in_proj_a = nn.Linear(config.n_embd, self.n_v_heads, bias=False)
 
-        # conv1d with no padding — we manage state manually
         self.conv1d = nn.Conv1d(
             self.conv_dim, self.conv_dim, config.linear_conv_kernel_dim,
             groups=self.conv_dim, padding=0, bias=False,
         )
 
-        self.norm = RMSNorm(self.head_v_dim, eps=config.rms_norm_eps)
+        self.dt_bias = nn.Parameter(torch.ones(self.n_v_heads))
+        A = torch.empty(self.n_v_heads).uniform_(0, 16)
+        self.A_log = nn.Parameter(torch.log(A))
+
+        self.norm = RMSNormGated(self.head_v_dim, eps=config.rms_norm_eps)
         self.out_proj = nn.Linear(self.value_dim, config.n_embd, bias=False)
 
-        # state buffers
+        # State buffers
         self.register_buffer(
             "conv_state", torch.zeros(1, self.conv_dim, config.linear_conv_kernel_dim)
         )
         self.register_buffer(
-            "recurrent_state", torch.zeros(1, self.n_k_heads, self.head_k_dim, self.head_v_dim)
+            "recurrent_state", torch.zeros(1, self.n_v_heads, self.head_k_dim, self.head_v_dim)
         )
 
     def forward(self, x, input_pos):
         B, T, C = x.size()
 
-        # reset state at position 0 (exportable — no Python if)
+        # Reset state at position 0 (exportable — no Python if)
         reset = (input_pos[0] == 0).to(self.conv_state.dtype)
         keep = 1.0 - reset
         self.conv_state[:B].mul_(keep)
         self.recurrent_state[:B].mul_(keep)
 
-        # projections
-        qkvz = self.in_proj_qkvz(x)
-        qkv, z = qkvz.split([self.conv_dim, self.value_dim], dim=-1)
-        z = z.view(B, T, self.n_v_heads, self.head_v_dim)
+        # Projections
+        qkv = self.in_proj_qkv(x)
+        z = self.in_proj_z(x).reshape(B, T, self.n_v_heads, self.head_v_dim)
+        b = self.in_proj_b(x)
+        a = self.in_proj_a(x)
 
-        beta = torch.sigmoid(self.in_proj_b(x))
-        alpha = torch.sigmoid(self.in_proj_a(x))
-
-        # causal conv1d with state
-        qkv_t = qkv.transpose(1, 2)  # (B, conv_dim, T)
-        conv_input = torch.cat([self.conv_state[:B], qkv_t], dim=-1)  # (B, conv_dim, K+T)
+        # Causal conv1d with state
+        qkv_t = qkv.transpose(1, 2)
+        conv_input = torch.cat([self.conv_state[:B], qkv_t], dim=-1)
         with torch.no_grad():
             self.conv_state[:B].copy_(conv_input[:, :, -self.conv_kernel_size:])
-        qkv_conv = F.conv1d(conv_input, self.conv1d.weight, bias=None, padding=0, groups=self.conv_dim)
-        qkv_conv = F.silu(qkv_conv[:, :, -T:])  # (B, conv_dim, T)
-        qkv_conv = qkv_conv.transpose(1, 2)  # (B, T, conv_dim)
+        qkv_conv = F.conv1d(
+            conv_input, self.conv1d.weight, bias=None, padding=0, groups=self.conv_dim
+        )
+        qkv_conv = F.silu(qkv_conv[:, :, -T:]).transpose(1, 2)
 
-        # split and normalize
-        q, k, v = qkv_conv.split([self.key_dim, self.key_dim, self.value_dim], dim=-1)
-        q = F.normalize(q.view(B, T, self.n_k_heads, self.head_k_dim), p=2, dim=-1)
-        k = F.normalize(k.view(B, T, self.n_k_heads, self.head_k_dim), p=2, dim=-1)
-        v = v.view(B, T, self.n_v_heads, self.head_v_dim)
+        # Split and L2-normalize Q and K
+        kd = self.key_dim
+        q = qkv_conv[..., :kd].reshape(B, T, self.n_k_heads, self.head_k_dim)
+        k = qkv_conv[..., kd:2*kd].reshape(B, T, self.n_k_heads, self.head_k_dim)
+        v = qkv_conv[..., 2*kd:].reshape(B, T, self.n_v_heads, self.head_v_dim)
 
-        # delta rule recurrence
-        # use_fla=True:  FLA Triton kernel via triton::chunk_gated_delta_rule (CUDA)
-        # use_fla=False: torch.scan (portable/xnnpack, dynamic T)
+        q = F.normalize(q, p=2, dim=-1)
+        k = F.normalize(k, p=2, dim=-1)
+
+        if self.head_repeat > 1:
+            q = q.repeat_interleave(self.head_repeat, dim=2)
+            k = k.repeat_interleave(self.head_repeat, dim=2)
+
+        # Mamba-style gating
+        beta = b.sigmoid()
+        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+
+        # Delta rule: FLA Triton kernel (CUDA) or torch.scan (portable)
         state = self.recurrent_state[:B].clone()
 
         if self.use_fla:
-            g = torch.log(alpha + 1e-6)  # FLA expects log-space decay
             output, state = torch.ops.triton.chunk_gated_delta_rule(
                 q, k, v, g, beta, state
             )
@@ -179,49 +198,84 @@ class ExportGatedDeltaNet(nn.Module):
             q_t = q.transpose(0, 1).contiguous()
             k_t = k.transpose(0, 1).contiguous()
             v_t = v.transpose(0, 1).contiguous()
-            alpha_t = alpha.transpose(0, 1).unsqueeze(-1).unsqueeze(-1).contiguous()
+            g_t = g.transpose(0, 1).unsqueeze(-1).unsqueeze(-1).contiguous()
             beta_t = beta.transpose(0, 1).unsqueeze(-1).unsqueeze(-1).contiguous()
 
             def step_fn(carry, xs):
-                q_i, k_i, v_i, a_i, b_i = xs
-                new_carry = a_i * carry + b_i * (k_i.unsqueeze(-1) * v_i.unsqueeze(-2))
+                q_i, k_i, v_i, g_i, b_i = xs
+                new_carry = torch.exp(g_i) * carry + b_i * (
+                    k_i.unsqueeze(-1) * v_i.unsqueeze(-2)
+                )
                 out_i = torch.einsum('bhk,bhkv->bhv', q_i, new_carry)
                 return new_carry.clone(), out_i.clone()
 
-            state, outputs_stacked = scan(step_fn, state, (q_t, k_t, v_t, alpha_t, beta_t))
+            state, outputs_stacked = scan(step_fn, state, (q_t, k_t, v_t, g_t, beta_t))
             output = outputs_stacked.transpose(0, 1)
 
         with torch.no_grad():
             self.recurrent_state[:B].copy_(state)
 
-        output = self.norm(output) * F.sigmoid(z)
-        return self.out_proj(output.reshape(B, T, -1))
+        # RMSNorm(output) * silu(z)
+        output = output.reshape(-1, self.head_v_dim)
+        z = z.reshape(-1, self.head_v_dim)
+        output = self.norm(output, z)
+        output = output.reshape(B, T, -1)
+
+        return self.out_proj(output)
 
 
 # ---------------------------------------------------------------------------
-# Export-friendly MoE: stacked expert weights + index by top-k indices.
-# Only the selected experts' weights participate in computation.
-# Pattern from ET's ConditionalFeedForward (llama_transformer.py).
+# Export-friendly MoE: grouped nn.Linear experts for quantization.
+# Experts are split into groups so each nn.Linear stays small enough for
+# tinygemm int4 packing. quantize_model_() handles them automatically.
+
+_EXPERTS_PER_GROUP = 4
+
 
 class ConditionalFeedForward(nn.Module):
-    """All expert weights stacked as (E, H, D) tensors. Indexed by expert_indices."""
 
     def __init__(self, n_embd, intermediate_size, n_experts):
         super().__init__()
-        self.w_gate = nn.Parameter(torch.randn(n_experts, intermediate_size, n_embd))  # (E, H, D)
-        self.w_up = nn.Parameter(torch.randn(n_experts, intermediate_size, n_embd))    # (E, H, D)
-        self.w_down = nn.Parameter(torch.randn(n_experts, n_embd, intermediate_size))  # (E, D, H)
+        self.n_experts = n_experts
+        self.intermediate_size = intermediate_size
+        self.hidden_size = n_embd
+        G = _EXPERTS_PER_GROUP
+        assert n_experts % G == 0
+        num_groups = n_experts // G
+
+        self.gate_up_projs = nn.ModuleList([
+            nn.Linear(n_embd, G * intermediate_size * 2, bias=False)
+            for _ in range(num_groups)
+        ])
+        self.down_projs = nn.ModuleList([
+            nn.Linear(intermediate_size, G * n_embd, bias=False)
+            for _ in range(num_groups)
+        ])
 
     def forward(self, x, expert_indices):
-        # x: (T, D), expert_indices: (T, top_k)
-        # w_gate, w_up: (E, H, D) — same layout as nn.Linear.weight
-        # w_down: (E, D, H) — transposed from nn.Linear(H, D).weight which is (D, H)
-        w_gate = self.w_gate[expert_indices]   # (T, A, H, D)
-        w_up = self.w_up[expert_indices]       # (T, A, H, D)
-        w_down = self.w_down[expert_indices]   # (T, A, D, H)
-        x1 = F.silu(torch.einsum("td,tahd -> tah", x, w_gate))
-        x3 = torch.einsum("td,tahd -> tah", x, w_up)
-        return torch.einsum("tah,tadh -> tad", x1 * x3, w_down)
+        T = x.size(0)
+        top_k = expert_indices.size(1)
+        G = _EXPERTS_PER_GROUP
+        H = self.intermediate_size
+        D = self.hidden_size
+
+        # Gate + Up: compute per-group, cat, gather top-k
+        gate_up_parts = [proj(x).view(T, G, 2, H) for proj in self.gate_up_projs]
+        gate_up = torch.cat(gate_up_parts, dim=1)  # (T, E, 2, H)
+
+        idx = expert_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 2, H)
+        gate_up_sel = gate_up.gather(1, idx)  # (T, top_k, 2, H)
+        intermediate = F.silu(gate_up_sel[:, :, 0, :]) * gate_up_sel[:, :, 1, :]
+
+        # Down: compute per-group, cat, gather correct expert per slot
+        intermediate_flat = intermediate.reshape(T * top_k, H)
+        down_parts = [
+            proj(intermediate_flat).view(T, top_k, G, D) for proj in self.down_projs
+        ]
+        all_down = torch.cat(down_parts, dim=2)  # (T, top_k, E, D)
+
+        eidx = expert_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, D)
+        return all_down.gather(2, eidx).squeeze(2)  # (T, top_k, D)
 
 
 class ExportSparseMoE(nn.Module):
@@ -229,12 +283,10 @@ class ExportSparseMoE(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.top_k = config.n_experts_per_tok
-        self.n_experts = config.n_routed_experts
-        self.dim = config.n_embd
 
         self.gate = nn.Linear(config.n_embd, config.n_routed_experts, bias=False)
         self.cond_ffn = ConditionalFeedForward(
-            config.n_embd, config.expert_intermediate_size, config.n_routed_experts
+            config.n_embd, config.expert_intermediate_size, config.n_routed_experts,
         )
         self.shared_expert = MLP(config.n_embd, config.shared_expert_intermediate_size)
         self.shared_expert_gate = nn.Linear(config.n_embd, 1, bias=False)
@@ -243,16 +295,13 @@ class ExportSparseMoE(nn.Module):
         B, T, C = x.size()
         x_flat = x.view(-1, C)
 
-        # Route: softmax → top-k
-        scores = self.gate(x_flat)                                     # (T, E)
+        scores = self.gate(x_flat)
         expert_weights, expert_indices = torch.topk(scores, self.top_k, dim=-1)
-        expert_weights = expert_weights.softmax(dim=-1)                # (T, top_k)
+        expert_weights = expert_weights.softmax(dim=-1)
 
-        # Only selected experts run (indexed into stacked weights)
-        expert_outs = self.cond_ffn(x_flat, expert_indices)            # (T, top_k, D)
+        expert_outs = self.cond_ffn(x_flat, expert_indices)
         routed_out = torch.einsum("tai,ta->ti", expert_outs, expert_weights)
 
-        # Shared expert
         shared_out = self.shared_expert(x_flat)
         shared_gate = torch.sigmoid(self.shared_expert_gate(x_flat))
         return (routed_out + shared_gate * shared_out).view(B, T, C)
@@ -310,19 +359,14 @@ class ExportQwen35MoE(nn.Module):
         export_model = ExportQwen35MoE(config, use_fla=use_fla)
         eager_sd = ckpt['model']
 
-        # Remap eager keys → export keys, and stack per-expert weights
         new_sd = {}
-        # Collect per-expert weights for stacking
-        expert_weights = {}  # (layer_idx, proj_name, expert_idx) → tensor
+        expert_weights = {}  # (layer_idx, proj, expert_idx) → tensor
 
         for k, v in eager_sd.items():
-            # Remap prefixes
             ek = k.replace('transformer.wte.', 'wte.')
             ek = ek.replace('transformer.ln_f.', 'ln_f.')
             ek = ek.replace('transformer.h.', 'layers.')
 
-            # Check if this is a per-expert weight: layers.N.mlp.experts.E.{gate,up,down}_proj.weight
-            import re
             m = re.match(r'layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate|up|down)_proj\.weight', ek)
             if m:
                 layer_idx, expert_idx, proj = int(m.group(1)), int(m.group(2)), m.group(3)
@@ -330,15 +374,34 @@ class ExportQwen35MoE(nn.Module):
             else:
                 new_sd[ek] = v
 
-        # Stack per-expert weights into (E, H, D) tensors for ConditionalFeedForward
-        proj_map = {'gate': 'w_gate', 'up': 'w_up', 'down': 'w_down'}
+        # Stack per-expert weights into grouped nn.Linear format
+        G = _EXPERTS_PER_GROUP
         for layer_idx in range(config.n_layer):
-            for proj, param_name in proj_map.items():
-                stacked = torch.stack([
-                    expert_weights[(layer_idx, proj, e)]
-                    for e in range(config.n_routed_experts)
-                ], dim=0)  # (E, H, D) or (E, D, H) depending on Linear layout
-                new_sd[f'layers.{layer_idx}.mlp.cond_ffn.{param_name}'] = stacked
+            gate_list = [expert_weights.get((layer_idx, "gate", e))
+                         for e in range(config.n_routed_experts)]
+            up_list = [expert_weights.get((layer_idx, "up", e))
+                       for e in range(config.n_routed_experts)]
+            down_list = [expert_weights.get((layer_idx, "down", e))
+                         for e in range(config.n_routed_experts)]
+
+            if gate_list[0] is not None:
+                w_gate = torch.stack(gate_list, dim=0)  # (E, H, D)
+                w_up = torch.stack(up_list, dim=0)
+                fused = torch.cat([w_gate, w_up], dim=1)  # (E, 2*H, D)
+                num_groups = config.n_routed_experts // G
+                for g in range(num_groups):
+                    chunk = fused[g * G:(g + 1) * G]
+                    new_sd[f'layers.{layer_idx}.mlp.cond_ffn.gate_up_projs.{g}.weight'] = (
+                        chunk.reshape(-1, chunk.size(-1))
+                    )
+            if down_list[0] is not None:
+                w_down = torch.stack(down_list, dim=0)  # (E, D, H)
+                num_groups = config.n_routed_experts // G
+                for g in range(num_groups):
+                    chunk = w_down[g * G:(g + 1) * G]
+                    new_sd[f'layers.{layer_idx}.mlp.cond_ffn.down_projs.{g}.weight'] = (
+                        chunk.reshape(-1, chunk.size(-1))
+                    )
 
         export_model.load_state_dict(new_sd, strict=False)
         return export_model, config
