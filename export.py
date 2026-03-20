@@ -5,7 +5,7 @@ Usage:
   python export.py                        # portable (CPU)
   python export.py --backend xnnpack      # XNNPACK
   python export.py --backend cuda         # CUDA (uses FLA Triton kernels for GDN)
-  python export.py --backend cuda --qlinear 4w --qlinear-packing-format tile_packed_to_4d
+  python export.py --backend cuda --qlinear 4w
 """
 
 import argparse
@@ -16,7 +16,7 @@ import torch
 import torch.nn as nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from export_model import ExportQwen35MoE, ExportCausalSelfAttention
+from export_model import ExportQwen35MoE
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -51,28 +51,51 @@ def load_and_quantize(args):
     return model, config
 
 
+def _to_device_skip_meta(module, device, dtype=None):
+    """Move submodules to device, skipping any that have meta-device buffers.
+
+    Uses module.to() on leaf submodules (not p.data = p.data.to()) to
+    correctly handle tensor subclasses like Int4TilePackedTo4dTensor.
+    """
+    for _, submod in module.named_modules():
+        has_meta = any(
+            b.device.type == "meta" for _, b in submod.named_buffers(recurse=False)
+        )
+        if has_meta:
+            continue
+        if list(submod.parameters(recurse=False)):
+            if dtype:
+                submod.to(device=device, dtype=dtype)
+            else:
+                submod.to(device=device)
+
+
 def _quantize(model, config, args):
-    """Quantize model. Each module is moved to CUDA for quantization
-    (tinygemm int4 packing requires CUDA), then moved back to CPU.
-    torch.export traces without executing ops, so the model stays on CPU.
+    """Quantize layer-by-layer on CUDA, keeping the model on CPU.
+
+    Only submodules with parameters (and no meta buffers) are moved to
+    CUDA. The quantized model stays on CPU — torch.export traces the
+    graph without executing ops, so CUDA is not needed.
     """
     from executorch.extension.llm.export.quantize import quantize_model_
+
+    packing = "tile_packed_to_4d" if args.qlinear == "4w" else None
 
     # Untie lm_head/embedding for independent quantization
     if model.lm_head.weight.data_ptr() == model.wte.weight.data_ptr():
         model.lm_head.weight = nn.Parameter(model.wte.weight.clone())
 
-    # Quantize layers (move to CUDA one at a time for large models)
+    # Quantize layers (move params to CUDA one layer at a time)
     for i, layer in enumerate(model.layers):
-        layer.to(device="cuda", dtype=torch.bfloat16)
+        _to_device_skip_meta(layer, device="cuda", dtype=torch.bfloat16)
         if args.qlinear:
             quantize_model_(
                 layer,
                 qlinear_config=args.qlinear,
                 qlinear_group_size=args.qlinear_group_size,
-                qlinear_packing_format=args.qlinear_packing_format,
+                qlinear_packing_format=packing,
             )
-        layer.to(device="cpu")
+        _to_device_skip_meta(layer, device="cpu")
         torch.cuda.empty_cache()
         print(f"  Quantized layer {i + 1}/{config.n_layer}", end="\r")
     print()
@@ -86,7 +109,7 @@ def _quantize(model, config, args):
             wrapper,
             qlinear_config=args.qlinear,
             qlinear_group_size=args.qlinear_group_size,
-            qlinear_packing_format=args.qlinear_packing_format,
+            qlinear_packing_format=packing,
         )
         model.lm_head = wrapper.lm_head
         model.lm_head.to(device="cpu")
@@ -102,17 +125,14 @@ def _quantize(model, config, args):
     model.wte.to(dtype=torch.bfloat16)
     model.ln_f.to(dtype=torch.bfloat16)
 
+    # Cast float buffers (KV caches, conv/recurrent state) to bfloat16.
+    # Bool buffers (causal masks) are left untouched.
+    for _, buf in model.named_buffers():
+        if buf.is_floating_point():
+            buf.data = buf.data.to(dtype=torch.bfloat16)
+
     if args.qlinear:
         print(f"Quantized linear layers ({args.qlinear})")
-
-    # Restore bool causal masks (layer.to(dtype=bf16) converts bool masks
-    # to float, which breaks F.scaled_dot_product_attention masking)
-    for layer in model.layers:
-        if isinstance(layer.attn, ExportCausalSelfAttention):
-            mask = torch.tril(
-                torch.ones(config.block_size, config.block_size, dtype=torch.bool)
-            )
-            layer.attn.register_buffer("mask", mask)
 
 
 # ---------------------------------------------------------------------------
@@ -235,7 +255,6 @@ def main():
     parser.add_argument('--backend', default='portable', choices=['portable', 'xnnpack', 'cuda'])
     parser.add_argument('--qlinear', default=None, choices=['4w', '8w', '8da4w', '8da8w'])
     parser.add_argument('--qlinear-group-size', type=int, default=32)
-    parser.add_argument('--qlinear-packing-format', default=None, choices=['tile_packed_to_4d'])
     parser.add_argument('--qembedding', default=None, choices=['8w'])
     args = parser.parse_args()
 
