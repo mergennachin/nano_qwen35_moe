@@ -145,12 +145,14 @@ def main():
                                          config.block_size)
 
     elif args.mode == 'exported':
-        from executorch.runtime import Runtime
+        from executorch.extension.pybindings._portable_lib import _load_for_executorch
         assert os.path.exists(args.pte), f"Missing {args.pte} — run export.py first"
-        runtime = Runtime.get()
-        program = runtime.load_program(args.pte)
-        method = program.load_method("forward")
-        print(f"Loaded: {args.pte}")
+
+        # Check for .ptd file (CUDA backend stores weights externally)
+        ptd_path = os.path.join(os.path.dirname(os.path.abspath(args.pte)), 'aoti_cuda_blob.ptd')
+        data_path = ptd_path if os.path.exists(ptd_path) else None
+        module = _load_for_executorch(args.pte, data_path=data_path)
+        print(f"Loaded: {args.pte}" + (f" + {os.path.basename(ptd_path)}" if data_path else ""))
         device = 'cpu'
 
         # load config to get block_size
@@ -158,7 +160,7 @@ def main():
         max_seq_len = ckpt['config'].block_size
 
         def model_fn(t, p):
-            return method.execute([t.cpu(), p.cpu()])[0]
+            return module.forward([t.cpu(), p.cpu()])[0]
 
         tokens = generate_with_input_pos(model_fn, prompt_ids, args.num_tokens,
                                          args.temperature, args.top_k, device,

@@ -98,7 +98,8 @@ def _quantize(model, config, args):
         model.wte.to(dtype=torch.bfloat16)
         quantize_model_(model, qembedding_config=args.qembedding)
 
-    # Cast remaining unquantized modules
+    # Cast remaining unquantized modules to bfloat16
+    model.wte.to(dtype=torch.bfloat16)
     model.ln_f.to(dtype=torch.bfloat16)
 
     if args.qlinear:
