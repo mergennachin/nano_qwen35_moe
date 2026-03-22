@@ -7,7 +7,7 @@ A minimal, educational implementation of the Qwen3.5 MoE (Mixture of Experts) ar
 | File | Description |
 |------|-------------|
 | `model.py` | Model definition — all components in one file |
-| `export_model.py` | Export-compatible model (KV cache, GDN state buffers, grouped MoE experts) |
+| `export_model.py` | Export-compatible model (KV cache, GDN state buffers, fused MoE experts) |
 | `export.py` | Export to ExecuTorch .pte format (portable, XNNPACK, CUDA) |
 | `inference.py` | Run inference in three modes: eager, export_eager, exported |
 | `verify_export.py` | Verify all three modes produce identical output |
@@ -69,7 +69,7 @@ L L L F L L L F    (L = GatedDeltaNet, F = Full Attention)
 | KV cache as registered buffers | Full-attention layers need persistent state for autoregressive decode |
 | conv_state + recurrent_state buffers | GDN layers need persistent state across tokens |
 | `torch.scan` for GDN recurrence | Replaces `for t in range(T)` loop, enabling dynamic sequence lengths |
-| Grouped nn.Linear experts | Expert weights as nn.Linear for `quantize_model_()` compatibility. Groups keep each linear small enough for tinygemm int4 packing. |
+| Fused MoE experts | Expert weights stored as stacked `[E, N, K]` tensors, quantized to packed INT4 for the fused MoE Triton kernel. |
 | `forward(tokens, input_pos)` signature | Matches ExecuTorch's LLM convention |
 
 ```bash
@@ -80,7 +80,7 @@ python export.py
 python export.py --backend xnnpack
 
 # Export with CUDA backend + int4 quantization
-python export.py --backend cuda --qlinear 4w --qlinear-packing-format tile_packed_to_4d --qembedding 8w
+python export.py --backend cuda --qlinear 4w --qembedding 8w
 
 # Verify all modes produce identical output
 python verify_export.py
@@ -115,7 +115,7 @@ This separation lets you iterate on export without re-quantizing, and test the q
 | Feature | This Implementation | Production (vLLM/ExecuTorch) |
 |---------|-------------------|---------------------|
 | GDN recurrence | `torch.scan` (portable) or FLA Triton kernel (CUDA) | Chunked parallel scan (FLA/FlashInfer) |
-| MoE dispatch | Grouped nn.Linear + gather | Fused CUDA kernel (FusedMoE) |
+| MoE dispatch | Fused MoE Triton kernel (INT4 W4A16) | Fused CUDA kernel (FusedMoE) |
 | Parallelism | None (single device) | TP, EP, PP, sequence parallel |
 
 The architecture (norms, gating, attention, RoPE) matches the HF reference (`transformers/models/qwen3_5_moe/`) exactly. Real Qwen3.5 checkpoints can be loaded with appropriate key remapping — see `executorch/examples/models/qwen3_5_moe/` for the full-size model.
@@ -134,7 +134,7 @@ python inference.py --mode eager --device cuda
 # Export to ExecuTorch
 python export.py                        # portable (CPU)
 python export.py --backend xnnpack      # XNNPACK
-python export.py --backend cuda         # CUDA (requires FLA Triton kernels)
+python export.py --backend cuda --qlinear 4w --qembedding 8w  # CUDA (fused MoE + INT4)
 
 # Run inference on exported model (Python)
 python inference.py --mode exported

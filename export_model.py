@@ -5,7 +5,7 @@ Transforms the eager model.py into a version that torch.export can trace:
   - forward(tokens, input_pos) signature for autoregressive decode
   - KV cache as registered buffers for full-attention layers
   - conv_state + recurrent_state as registered buffers for GDN layers
-  - Export-friendly MoE: grouped nn.Linear experts (quantization-compatible)
+  - Fused MoE experts as stacked tensors for Triton kernel
 
 Reference: executorch/examples/models/qwen3_5_moe/ (full-size model)
 """
@@ -225,67 +225,42 @@ class ExportGatedDeltaNet(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Export-friendly MoE: grouped nn.Linear experts for quantization.
-# Experts are split into groups so each nn.Linear stays small enough for
-# tinygemm int4 packing. quantize_model_() handles them automatically.
+# MoE: expert weights for fused MoE Triton kernel
 
-_EXPERTS_PER_GROUP = 4
+class FusedMoEExperts(nn.Module):
+    """Expert weights stored as stacked tensors for the fused MoE Triton kernel.
 
+    Before quantization: w1_weight [E, 2*inter, hidden] and w2_weight [E, hidden, inter]
+    are nn.Parameter tensors loaded from the checkpoint.
 
-class ConditionalFeedForward(nn.Module):
+    After quantization (in export.py): replaced with packed INT4 buffers
+    w1 [E, 2*inter, hidden//2], w1_scale, w2 [E, hidden, inter//2], w2_scale.
+    """
 
-    def __init__(self, n_embd, intermediate_size, n_experts):
+    def __init__(self, n_embd, intermediate_size, n_experts, group_size=32):
         super().__init__()
         self.n_experts = n_experts
         self.intermediate_size = intermediate_size
         self.hidden_size = n_embd
-        G = _EXPERTS_PER_GROUP
-        assert n_experts % G == 0
-        num_groups = n_experts // G
+        self.group_size = group_size
 
-        self.gate_up_projs = nn.ModuleList([
-            nn.Linear(n_embd, G * intermediate_size * 2, bias=False)
-            for _ in range(num_groups)
-        ])
-        self.down_projs = nn.ModuleList([
-            nn.Linear(intermediate_size, G * n_embd, bias=False)
-            for _ in range(num_groups)
-        ])
-
-    def forward(self, x, expert_indices):
-        T = x.size(0)
-        top_k = expert_indices.size(1)
-        G = _EXPERTS_PER_GROUP
-        H = self.intermediate_size
-        D = self.hidden_size
-
-        # Gate + Up: compute per-group, cat, gather top-k
-        gate_up_parts = [proj(x).view(T, G, 2, H) for proj in self.gate_up_projs]
-        gate_up = torch.cat(gate_up_parts, dim=1)  # (T, E, 2, H)
-
-        idx = expert_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 2, H)
-        gate_up_sel = gate_up.gather(1, idx)  # (T, top_k, 2, H)
-        intermediate = F.silu(gate_up_sel[:, :, 0, :]) * gate_up_sel[:, :, 1, :]
-
-        # Down: compute per-group, cat, gather correct expert per slot
-        intermediate_flat = intermediate.reshape(T * top_k, H)
-        down_parts = [
-            proj(intermediate_flat).view(T, top_k, G, D) for proj in self.down_projs
-        ]
-        all_down = torch.cat(down_parts, dim=2)  # (T, top_k, E, D)
-
-        eidx = expert_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, D)
-        return all_down.gather(2, eidx).squeeze(2)  # (T, top_k, D)
-
+        # Pre-quantization weights (replaced by buffers after quantization)
+        self.w1_weight = nn.Parameter(
+            torch.empty(n_experts, 2 * intermediate_size, n_embd)
+        )
+        self.w2_weight = nn.Parameter(
+            torch.empty(n_experts, n_embd, intermediate_size)
+        )
 
 class ExportSparseMoE(nn.Module):
 
     def __init__(self, config):
         super().__init__()
         self.top_k = config.n_experts_per_tok
+        self.n_experts = config.n_routed_experts
 
         self.gate = nn.Linear(config.n_embd, config.n_routed_experts, bias=False)
-        self.cond_ffn = ConditionalFeedForward(
+        self.experts = FusedMoEExperts(
             config.n_embd, config.expert_intermediate_size, config.n_routed_experts,
         )
         self.shared_expert = MLP(config.n_embd, config.shared_expert_intermediate_size)
@@ -299,8 +274,13 @@ class ExportSparseMoE(nn.Module):
         expert_weights, expert_indices = torch.topk(scores, self.top_k, dim=-1)
         expert_weights = expert_weights.softmax(dim=-1)
 
-        expert_outs = self.cond_ffn(x_flat, expert_indices)
-        routed_out = torch.einsum("tai,ta->ti", expert_outs, expert_weights)
+        routed_out = torch.ops.triton.fused_moe(
+            x_flat,
+            self.experts.w1, self.experts.w1_scale,
+            self.experts.w2, self.experts.w2_scale,
+            expert_weights.float(), expert_indices,
+            self.top_k, self.n_experts, self.experts.group_size,
+        )
 
         shared_out = self.shared_expert(x_flat)
         shared_gate = torch.sigmoid(self.shared_expert_gate(x_flat))
@@ -352,9 +332,11 @@ class ExportQwen35MoE(nn.Module):
         return self.lm_head(x)
 
     @staticmethod
-    def from_checkpoint(ckpt_path, device='cpu', use_fla=False):
+    def from_checkpoint(ckpt_path, device='cpu', use_fla=False, max_seq_len=None):
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         config = ckpt['config']
+        if max_seq_len is not None:
+            config.block_size = max_seq_len
 
         export_model = ExportQwen35MoE(config, use_fla=use_fla)
         eager_sd = ckpt['model']
@@ -374,8 +356,6 @@ class ExportQwen35MoE(nn.Module):
             else:
                 new_sd[ek] = v
 
-        # Stack per-expert weights into grouped nn.Linear format
-        G = _EXPERTS_PER_GROUP
         for layer_idx in range(config.n_layer):
             gate_list = [expert_weights.get((layer_idx, "gate", e))
                          for e in range(config.n_routed_experts)]
@@ -388,20 +368,10 @@ class ExportQwen35MoE(nn.Module):
                 w_gate = torch.stack(gate_list, dim=0)  # (E, H, D)
                 w_up = torch.stack(up_list, dim=0)
                 fused = torch.cat([w_gate, w_up], dim=1)  # (E, 2*H, D)
-                num_groups = config.n_routed_experts // G
-                for g in range(num_groups):
-                    chunk = fused[g * G:(g + 1) * G]
-                    new_sd[f'layers.{layer_idx}.mlp.cond_ffn.gate_up_projs.{g}.weight'] = (
-                        chunk.reshape(-1, chunk.size(-1))
-                    )
+                new_sd[f'layers.{layer_idx}.mlp.experts.w1_weight'] = fused
             if down_list[0] is not None:
                 w_down = torch.stack(down_list, dim=0)  # (E, D, H)
-                num_groups = config.n_routed_experts // G
-                for g in range(num_groups):
-                    chunk = w_down[g * G:(g + 1) * G]
-                    new_sd[f'layers.{layer_idx}.mlp.cond_ffn.down_projs.{g}.weight'] = (
-                        chunk.reshape(-1, chunk.size(-1))
-                    )
+                new_sd[f'layers.{layer_idx}.mlp.experts.w2_weight'] = w_down
 
         export_model.load_state_dict(new_sd, strict=False)
         return export_model, config

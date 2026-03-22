@@ -36,13 +36,16 @@ def load_and_quantize(args):
 
     print(f"Loading checkpoint...")
     model, config = ExportQwen35MoE.from_checkpoint(
-        args.checkpoint, device='cpu', use_fla=use_fla
+        args.checkpoint, device='cpu', use_fla=use_fla,
+        max_seq_len=args.max_seq_len,
     )
     model.eval()
     print(f"Model: {config.n_layer} layers, {config.n_embd}d, "
           f"{config.n_routed_experts} experts top-{config.n_experts_per_tok}")
 
     if args.qlinear or args.qembedding:
+        if args.qlinear:
+            _quantize_experts_int4(model, config, args.qlinear_group_size)
         _quantize(model, config, args)
     else:
         dtype = torch.bfloat16 if is_cuda else torch.float32
@@ -68,6 +71,55 @@ def _to_device_skip_meta(module, device, dtype=None):
                 submod.to(device=device, dtype=dtype)
             else:
                 submod.to(device=device)
+
+
+def _quantize_experts_int4(model, config, group_size=32):
+    """Quantize expert weights to simple packed INT4 for the fused MoE kernel.
+
+    Uses torchao primitives for quantization, then packs two int4 values
+    per byte for the Triton kernel's dequantization format.
+    """
+    from export_model import FusedMoEExperts
+    from torchao.quantization.quant_primitives import (
+        MappingType,
+        choose_qparams_affine,
+        quantize_affine,
+    )
+
+    for i, layer in enumerate(model.layers):
+        experts = layer.mlp.experts
+        if not isinstance(experts, FusedMoEExperts):
+            continue
+
+        experts.group_size = group_size
+        for name in ("w1_weight", "w2_weight"):
+            w = getattr(experts, name).data.float()
+            E, N, K = w.shape
+
+            block_size = (1, 1, group_size)
+            scale, zero_point = choose_qparams_affine(
+                w, MappingType.SYMMETRIC, block_size,
+                target_dtype=torch.int8, quant_min=-8, quant_max=7,
+            )
+            int_data = quantize_affine(
+                w, block_size, scale, zero_point,
+                output_dtype=torch.int8, quant_min=-8, quant_max=7,
+            )
+
+            # Pack two int4 values per byte
+            uint4 = (int_data + 8).to(torch.int16)
+            low = uint4[:, :, 0::2]
+            high = uint4[:, :, 1::2]
+            packed = (low | (high << 4)).to(torch.int8)
+
+            buf_name = name.replace("_weight", "")
+            experts.register_buffer(buf_name, packed)
+            experts.register_buffer(f"{buf_name}_scale", scale.reshape(E, N, -1).to(torch.bfloat16))
+            delattr(experts, name)
+
+        print(f"  Quantized experts (INT4 packed) layer {i + 1}/{config.n_layer}",
+              end="\r")
+    print()
 
 
 def _quantize(model, config, args):
@@ -253,6 +305,8 @@ def main():
     parser.add_argument('--checkpoint', default=os.path.join(_DIR, 'checkpoint/ckpt.pt'))
     parser.add_argument('--output', default=None)
     parser.add_argument('--backend', default='portable', choices=['portable', 'xnnpack', 'cuda'])
+    parser.add_argument('--max-seq-len', type=int, default=None,
+                        help="Override max sequence length (default: from checkpoint)")
     parser.add_argument('--qlinear', default=None, choices=['4w', '8w', '8da4w', '8da8w'])
     parser.add_argument('--qlinear-group-size', type=int, default=32)
     parser.add_argument('--qembedding', default=None, choices=['8w'])

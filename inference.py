@@ -128,8 +128,11 @@ def main():
                                 args.temperature, args.top_k, args.device)
 
     elif args.mode == 'export_eager':
+        import executorch.backends.cuda.triton.kernels  # noqa: F401
+        from export import _quantize_experts_int4
         from export_model import ExportQwen35MoE
         model, config = ExportQwen35MoE.from_checkpoint(args.ckpt, device=args.device)
+        _quantize_experts_int4(model, config)
         model.to(args.device)
         model.eval()
         pattern = ''.join('F' if t == 'full_attention' else 'L' for t in config.layer_types)
